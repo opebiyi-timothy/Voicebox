@@ -81,7 +81,11 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
@@ -99,7 +103,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun App(vm: MainViewModel) {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("Voices", "Presets", "Speak", "Settings")
+    val tabs = listOf("Voices", "Presets", "Speak", "History", "Settings")
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -111,13 +115,15 @@ fun App(vm: MainViewModel) {
     ) { pad ->
         Column(Modifier.padding(pad).padding(16.dp).fillMaxSize()) {
             if (vm.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            when (tab) {
-                0 -> VoicesTab(vm)
-                1 -> PresetsTab(vm)
-                2 -> SpeakTab(vm)
-                else -> SettingsTab(vm)
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+                when (tab) {
+                    0 -> VoicesTab(vm)
+                    1 -> PresetsTab(vm)
+                    2 -> SpeakTab(vm)
+                    3 -> HistoryTab(vm)
+                    else -> SettingsTab(vm)
+                }
             }
-            Spacer(Modifier.weight(1f))
             Text(vm.status, style = MaterialTheme.typography.bodySmall)
         }
     }
@@ -129,6 +135,7 @@ fun VoicesTab(vm: MainViewModel) {
     var lang by remember { mutableStateOf("en") }
     var refText by remember { mutableStateOf("") }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { vm.importSample(it) } }
+    val restore = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris -> if (uris.isNotEmpty()) vm.restoreVoices(uris) }
     val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.toggleRecord() }
 
     Text("Voices", style = MaterialTheme.typography.titleLarge)
@@ -155,15 +162,55 @@ fun VoicesTab(vm: MainViewModel) {
         }
         Button(onClick = { vm.uploadSample(refText) }, enabled = !vm.recording && !vm.busy) { Text("Upload") }
     }
+    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+    Text("Backup (keeps your cloned voices safe if the server resets)", style = MaterialTheme.typography.bodySmall)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = { vm.backupAll() }, enabled = !vm.busy) { Text("Back up my voices") }
+        OutlinedButton(onClick = { restore.launch("*/*") }, enabled = !vm.busy) { Text("Restore from file") }
+    }
 }
 
 @Composable
 fun SpeakTab(vm: MainViewModel) {
     var text by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) { if (vm.effectPresets.isEmpty()) vm.loadEffects() }
     Text("Speak as: ${vm.selected?.name ?: "(pick a voice in Voices)"}", style = MaterialTheme.typography.titleMedium)
     OutlinedTextField(text, { text = it }, label = { Text("Text") }, modifier = Modifier.fillMaxWidth().height(160.dp))
+    if (vm.effectPresets.isNotEmpty()) {
+        Text("Effect", style = MaterialTheme.typography.bodySmall)
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { FilterChip(vm.effectIndex == -1, { vm.effectIndex = -1 }, { Text("None") }) }
+            itemsIndexed(vm.effectPresets) { i, e -> FilterChip(vm.effectIndex == i, { vm.effectIndex = i }, { Text(e.first) }) }
+        }
+    }
     Button(onClick = { vm.speak(text) }, enabled = text.isNotBlank() && vm.selected != null && !vm.busy) { Text("Generate & play") }
-    if (vm.lastAudio != null) OutlinedButton(onClick = { vm.saveAudio() }) { Text("Save audio to Downloads") }
+    if (vm.lastAudio != null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { vm.saveAudio() }) { Text("Save") }
+            OutlinedButton(onClick = { vm.shareAudio() }) { Text("Share") }
+        }
+    }
+}
+
+@Composable
+fun HistoryTab(vm: MainViewModel) {
+    LaunchedEffect(Unit) { vm.loadHistory() }
+    Text("History", style = MaterialTheme.typography.titleLarge)
+    Text("Tap an item to play it.", style = MaterialTheme.typography.bodySmall)
+    LazyColumn(Modifier.heightIn(max = 400.dp)) {
+        items(vm.history) { h ->
+            Column(Modifier.fillMaxWidth().clickable { vm.playHistory(h.id) }.padding(8.dp)) {
+                Text(h.text.take(90))
+                Text(h.who, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    if (vm.lastAudio != null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = { vm.saveAudio() }) { Text("Save") }
+            OutlinedButton(onClick = { vm.shareAudio() }) { Text("Share") }
+        }
+    }
 }
 
 @Composable
@@ -195,7 +242,9 @@ package com.example.voiceboxmobile
 
 import android.app.Application
 import android.content.ContentValues
+import android.content.Intent
 import android.net.Uri
+import org.json.JSONArray
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -226,6 +275,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var presets by mutableStateOf<List<Pair<String, String>>>(emptyList())
     var lastAudio by mutableStateOf<ByteArray?>(null)
     private var player: MediaPlayer? = null
+    var history by mutableStateOf<List<HistoryItem>>(emptyList())
+    var effectPresets by mutableStateOf<List<Pair<String, JSONArray>>>(emptyList())
+    var effectIndex by mutableStateOf(-1)
 
     private fun api() = VoiceboxApi(serverUrl, apiKey)
 
@@ -276,27 +328,81 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         status = "Picked $name (${f.length() / 1024} KB)"
     }
 
-    fun saveAudio() {
-        val bytes = lastAudio ?: return
+    private fun saveToDownloads(
+        bytes: ByteArray,
+        name: String = "voicebox_${System.currentTimeMillis()}.wav",
+        mime: String = "audio/wav"
+    ): Uri? {
         val app = getApplication<Application>()
-        val name = "voicebox_${System.currentTimeMillis()}.wav"
-        try {
+        return try {
             if (Build.VERSION.SDK_INT >= 29) {
                 val v = ContentValues().apply {
                     put(MediaStore.Downloads.DISPLAY_NAME, name)
-                    put(MediaStore.Downloads.MIME_TYPE, "audio/wav")
+                    put(MediaStore.Downloads.MIME_TYPE, mime)
                     put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                 }
                 val uri = app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
                 app.contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
                 status = "Saved to Downloads: $name"
+                uri
             } else {
                 val dir = app.getExternalFilesDir(Environment.DIRECTORY_MUSIC)!!
                 File(dir, name).writeBytes(bytes)
                 status = "Saved to ${dir.path}"
+                null
             }
-        } catch (e: Exception) { status = "Save failed: ${e.message}" }
+        } catch (e: Exception) { status = "Save failed: ${e.message}"; null }
     }
+
+    fun backupAll() = run {
+        val custom = profiles.filter { it.presetEngine == null }
+        if (custom.isEmpty()) error("No cloned voices to back up")
+        for (p in custom) {
+            val zip = api().exportProfile(p.id)
+            saveToDownloads(zip, "voice_${p.name.replace(Regex("[^A-Za-z0-9_-]"), "_")}.zip", "application/zip")
+        }
+        status = "Backed up ${custom.size} voice(s) to Downloads"
+    }
+
+    fun restoreVoices(uris: List<Uri>) = run {
+        val app = getApplication<Application>()
+        for (u in uris) {
+            val bytes = withContext(Dispatchers.IO) { app.contentResolver.openInputStream(u)!!.use { it.readBytes() } }
+            api().importProfile(bytes)
+        }
+        profiles = api().listProfiles()
+        status = "Restored ${uris.size} voice(s)"
+    }
+
+    fun saveAudio() { lastAudio?.let { saveToDownloads(it) } }
+
+    fun shareAudio() {
+        val b = lastAudio ?: return
+        val uri = saveToDownloads(b)
+        if (uri == null) { status = "Sharing needs Android 10 or newer"; return }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "audio/wav"; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        getApplication<Application>().startActivity(
+            Intent.createChooser(send, "Share audio").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    private fun play(bytes: ByteArray) {
+        val f = File(getApplication<Application>().cacheDir, "out.wav").also { it.writeBytes(bytes) }
+        player?.release()
+        player = MediaPlayer().apply { setDataSource(f.path); prepare(); start() }
+    }
+
+    fun loadHistory() { if (serverUrl.isNotBlank()) run { history = api().listHistory() } }
+
+    fun playHistory(id: String) = run {
+        status = "Loading…"
+        val bytes = api().audio(id)
+        lastAudio = bytes; play(bytes); status = "Playing"
+    }
+
+    fun loadEffects() { if (serverUrl.isNotBlank()) run { effectPresets = api().listEffectPresets() } }
 
     fun uploadSample(referenceText: String) = run {
         val p = selected ?: error("Select a voice first")
@@ -309,11 +415,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun speak(text: String) = run {
         val p = selected ?: error("Select a voice first")
         status = "Generating…"
-        val bytes = api().generate(p.id, text, p.language, p.presetEngine) { status = it }
+        val chain = effectPresets.getOrNull(effectIndex)?.second
+        val bytes = api().generate(p.id, text, p.language, p.presetEngine, chain) { status = it }
         lastAudio = bytes
-        val f = File(getApplication<Application>().cacheDir, "out.wav").also { it.writeBytes(bytes) }
-        player?.release()
-        player = MediaPlayer().apply { setDataSource(f.path); prepare(); start() }
+        play(bytes)
         status = "Playing"
     }
 
@@ -336,6 +441,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
+
+data class HistoryItem(val id: String, val who: String, val text: String)
 
 data class Profile(val id: String, val name: String, val language: String, val presetEngine: String? = null)
 
@@ -434,6 +541,37 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
         }
     }
 
+
+    // GET /history -> {items:[{id,profile_name,text,status}], total}
+    suspend fun listHistory(): List<HistoryItem> = exec(Request.Builder().url("$base/history?limit=50").build()) { r ->
+        val arr = JSONObject(r.body!!.string()).optJSONArray("items") ?: JSONArray()
+        (0 until arr.length()).map { arr.getJSONObject(it) }
+            .filter { o -> o.optString("status") == "completed" }
+            .map { o -> HistoryItem(o.optString("id"), o.optString("profile_name"), o.optString("text")) }
+    }
+
+    // GET /audio/{id}
+    suspend fun audio(id: String): ByteArray = exec(Request.Builder().url("$base/audio/$id").build()) { it.body!!.bytes() }
+
+    // GET /effects/presets -> [{name, effects_chain}]
+    suspend fun listEffectPresets(): List<Pair<String, JSONArray>> = exec(Request.Builder().url("$base/effects/presets").build()) { r ->
+        val arr = JSONArray(r.body!!.string())
+        (0 until arr.length()).map { arr.getJSONObject(it) }
+            .map { o -> o.optString("name") to (o.optJSONArray("effects_chain") ?: JSONArray()) }
+    }
+
+    // GET /profiles/{id}/export -> ZIP
+    suspend fun exportProfile(id: String): ByteArray =
+        exec(Request.Builder().url("$base/profiles/$id/export").build()) { it.body!!.bytes() }
+
+    // POST /profiles/import multipart: file (ZIP)
+    suspend fun importProfile(zip: ByteArray) {
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("file", "voice.zip", zip.toRequestBody("application/zip".toMediaType()))
+            .build()
+        exec(Request.Builder().url("$base/profiles/import").post(body).build()) { }
+    }
+
     // POST /profiles/{id}/samples multipart: file (wav), reference_text
     suspend fun addSample(profileId: String, wav: File, referenceText: String) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -454,9 +592,9 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
     }
 
     // POST /generate -> {id,status:"generating"}; poll GET /history/{id}; then GET /audio/{id}
-    suspend fun generate(profileId: String, text: String, language: String, engine: String? = null, onStatus: (String) -> Unit = {}): ByteArray {
+    suspend fun generate(profileId: String, text: String, language: String, engine: String? = null, effects: JSONArray? = null, onStatus: (String) -> Unit = {}): ByteArray {
         val body = JSONObject().put("profile_id", profileId).put("text", text).put("language", language)
-            .apply { if (engine != null) put("engine", engine) }
+            .apply { if (engine != null) put("engine", engine); if (effects != null) put("effects_chain", effects) }
             .toString().toRequestBody(json)
         val id = exec(Request.Builder().url("$base/generate").post(body).build()) {
             JSONObject(it.body!!.string()).getString("id")
