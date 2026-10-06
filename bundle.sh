@@ -99,7 +99,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun App(vm: MainViewModel) {
     var tab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("Voices", "Speak", "Settings")
+    val tabs = listOf("Voices", "Presets", "Speak", "Settings")
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -113,7 +113,8 @@ fun App(vm: MainViewModel) {
             if (vm.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             when (tab) {
                 0 -> VoicesTab(vm)
-                1 -> SpeakTab(vm)
+                1 -> PresetsTab(vm)
+                2 -> SpeakTab(vm)
                 else -> SettingsTab(vm)
             }
             Spacer(Modifier.weight(1f))
@@ -127,6 +128,7 @@ fun VoicesTab(vm: MainViewModel) {
     var name by remember { mutableStateOf("") }
     var lang by remember { mutableStateOf("en") }
     var refText by remember { mutableStateOf("") }
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> uri?.let { vm.importSample(it) } }
     val mic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.toggleRecord() }
 
     Text("Voices", style = MaterialTheme.typography.titleLarge)
@@ -146,6 +148,7 @@ fun VoicesTab(vm: MainViewModel) {
     HorizontalDivider(Modifier.padding(vertical = 8.dp))
     Text("Add sample to: ${vm.selected?.name ?: "(select a voice)"}")
     OutlinedTextField(refText, { refText = it }, label = { Text("What you said (blank = auto-transcribe)") }, modifier = Modifier.fillMaxWidth())
+    OutlinedButton(onClick = { pick.launch("audio/*") }) { Text("Choose audio file instead") }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Button(onClick = { if (vm.recording) vm.toggleRecord() else mic.launch(Manifest.permission.RECORD_AUDIO) }) {
             Text(if (vm.recording) "Stop" else "Record")
@@ -160,6 +163,7 @@ fun SpeakTab(vm: MainViewModel) {
     Text("Speak as: ${vm.selected?.name ?: "(pick a voice in Voices)"}", style = MaterialTheme.typography.titleMedium)
     OutlinedTextField(text, { text = it }, label = { Text("Text") }, modifier = Modifier.fillMaxWidth().height(160.dp))
     Button(onClick = { vm.speak(text) }, enabled = text.isNotBlank() && vm.selected != null && !vm.busy) { Text("Generate & play") }
+    if (vm.lastAudio != null) OutlinedButton(onClick = { vm.saveAudio() }) { Text("Save audio to Downloads") }
 }
 
 @Composable
@@ -169,12 +173,35 @@ fun SettingsTab(vm: MainViewModel) {
     OutlinedTextField(vm.apiKey, { vm.apiKey = it }, label = { Text("API key") }, modifier = Modifier.fillMaxWidth())
     Button(onClick = { vm.saveSettings() }) { Text("Save & connect") }
 }
+
+@Composable
+fun PresetsTab(vm: MainViewModel) {
+    LaunchedEffect(Unit) { if (vm.presets.isEmpty()) vm.loadPresets() }
+    Text("Built-in voices", style = MaterialTheme.typography.titleLarge)
+    Text("Tap a voice, then open the Speak tab. The first use downloads the voice model (a few minutes).", style = MaterialTheme.typography.bodySmall)
+    LazyColumn(Modifier.heightIn(max = 460.dp)) {
+        items(vm.presets) { (id, label) ->
+            Text(
+                (if (vm.selected?.name == label) "● " else "○ ") + label,
+                Modifier.fillMaxWidth().clickable { vm.usePreset(id, label) }.padding(12.dp)
+            )
+        }
+    }
+}
 END_OF_FILE
 mkdir -p android/app/src/main/java/com/example/voiceboxmobile
 cat > android/app/src/main/java/com/example/voiceboxmobile/MainViewModel.kt <<'END_OF_FILE'
 package com.example.voiceboxmobile
 
 import android.app.Application
+import android.content.ContentValues
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import android.media.MediaPlayer
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -195,7 +222,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var recording by mutableStateOf(false)
 
     private var recorder: WavRecorder? = null
-    private val sampleFile = File(app.cacheDir, "sample.wav")
+    private var sampleFile = File(app.cacheDir, "sample.wav")
+    var presets by mutableStateOf<List<Pair<String, String>>>(emptyList())
+    var lastAudio by mutableStateOf<ByteArray?>(null)
     private var player: MediaPlayer? = null
 
     private fun api() = VoiceboxApi(serverUrl, apiKey)
@@ -218,9 +247,55 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         status = "Created ${selected?.name}"
     }
 
+    fun loadPresets() { if (serverUrl.isNotBlank()) run { presets = api().listPresets("kokoro") } }
+
+    fun usePreset(id: String, label: String) = run {
+        val existing = profiles.firstOrNull { it.presetEngine == "kokoro" && it.name == label }
+        selected = existing ?: api().createPreset(label, "en", "kokoro", id).also { profiles = api().listProfiles() }
+        status = "Selected $label. Now open the Speak tab."
+    }
+
     fun toggleRecord() {
         if (recording) { recorder?.stop(); recording = false; status = "Recorded ${sampleFile.length() / 1024} KB" }
-        else { recorder = WavRecorder(sampleFile).also { it.start() }; recording = true; status = "Recording…" }
+        else { sampleFile = File(getApplication<Application>().cacheDir, "sample.wav"); recorder = WavRecorder(sampleFile).also { it.start() }; recording = true; status = "Recording…" }
+    }
+
+    fun importSample(uri: Uri) = run {
+        val app = getApplication<Application>()
+        var name = "sample.wav"
+        app.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (i >= 0 && c.moveToFirst()) name = c.getString(i) ?: name
+        }
+        val ext = name.substringAfterLast('.', "wav").lowercase().ifBlank { "wav" }
+        val f = File(app.cacheDir, "sample.$ext")
+        withContext(Dispatchers.IO) {
+            app.contentResolver.openInputStream(uri)!!.use { inp -> f.outputStream().use { inp.copyTo(it) } }
+        }
+        sampleFile = f
+        status = "Picked $name (${f.length() / 1024} KB)"
+    }
+
+    fun saveAudio() {
+        val bytes = lastAudio ?: return
+        val app = getApplication<Application>()
+        val name = "voicebox_${System.currentTimeMillis()}.wav"
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val v = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "audio/wav")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
+                app.contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+                status = "Saved to Downloads: $name"
+            } else {
+                val dir = app.getExternalFilesDir(Environment.DIRECTORY_MUSIC)!!
+                File(dir, name).writeBytes(bytes)
+                status = "Saved to ${dir.path}"
+            }
+        } catch (e: Exception) { status = "Save failed: ${e.message}" }
     }
 
     fun uploadSample(referenceText: String) = run {
@@ -234,7 +309,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun speak(text: String) = run {
         val p = selected ?: error("Select a voice first")
         status = "Generating…"
-        val bytes = api().generate(p.id, text, p.language) { status = it }
+        val bytes = api().generate(p.id, text, p.language, p.presetEngine) { status = it }
+        lastAudio = bytes
         val f = File(getApplication<Application>().cacheDir, "out.wav").also { it.writeBytes(bytes) }
         player?.release()
         player = MediaPlayer().apply { setDataSource(f.path); prepare(); start() }
@@ -251,6 +327,7 @@ package com.example.voiceboxmobile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import android.webkit.MimeTypeMap
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
@@ -260,7 +337,7 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.TimeUnit
 
-data class Profile(val id: String, val name: String, val language: String)
+data class Profile(val id: String, val name: String, val language: String, val presetEngine: String? = null)
 
 /**
  * ALL server endpoint assumptions live in this file. Compare against
@@ -283,8 +360,14 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
         }
     }
 
+    private fun mediaTypeFor(f: File) =
+        (MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension.lowercase()) ?: "application/octet-stream").toMediaType()
+
     private fun parseProfile(o: JSONObject) =
-        Profile(o.optString("id"), o.optString("name"), o.optString("language", "en"))
+        Profile(
+            o.optString("id"), o.optString("name"), o.optString("language", "en"),
+            if (o.isNull("preset_engine")) null else o.optString("preset_engine").ifBlank { null }
+        )
 
     // GET /profiles -> [ {id,name,language}, ... ]
     suspend fun listProfiles(): List<Profile> = exec(Request.Builder().url("$base/profiles").build()) {
@@ -301,10 +384,60 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
         }
     }
 
+
+    private fun pretty(id: String): String {
+        val parts = id.split("_")
+        if (parts.size < 2) return id
+        val g = when (parts[0]) { "af" -> "US female"; "am" -> "US male"; "bf" -> "UK female"; "bm" -> "UK male"; else -> parts[0] }
+        return parts.drop(1).joinToString(" ").replaceFirstChar { it.uppercase() } + " ($g)"
+    }
+
+    private val fallbackPresets = listOf(
+        "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
+        "am_adam", "am_michael", "bf_emma", "bf_isabella", "bm_george", "bm_lewis"
+    ).map { it to pretty(it) }
+
+    // GET /profiles/presets/{engine}: response shape unknown, so parse flexibly; fall back to a built-in list
+    suspend fun listPresets(engine: String): List<Pair<String, String>> {
+        val parsed = runCatching {
+            exec(Request.Builder().url("$base/profiles/presets/$engine").build()) {
+                val any = org.json.JSONTokener(it.body!!.string()).nextValue()
+                val arr: JSONArray? = when (any) {
+                    is JSONArray -> any
+                    is JSONObject -> any.optJSONArray("voices") ?: any.optJSONArray("presets")
+                        ?: any.keys().asSequence().mapNotNull { k -> any.optJSONArray(k) }.firstOrNull()
+                    else -> null
+                }
+                (0 until (arr?.length() ?: 0)).mapNotNull { i ->
+                    when (val e = arr!!.get(i)) {
+                        is String -> e to pretty(e)
+                        is JSONObject -> {
+                            val id = e.optString("voice_id").ifBlank { e.optString("id") }.ifBlank { e.optString("name") }
+                            if (id.isBlank()) null else id to e.optString("name").ifBlank { pretty(id) }
+                        }
+                        else -> null
+                    }
+                }
+            }
+        }.getOrNull().orEmpty()
+        return parsed.ifEmpty { fallbackPresets }
+    }
+
+    // POST /profiles with voice_type "preset"
+    suspend fun createPreset(name: String, language: String, engine: String, voiceId: String): Profile {
+        val body = JSONObject().put("name", name).put("language", language)
+            .put("voice_type", "preset").put("preset_engine", engine)
+            .put("preset_voice_id", voiceId).put("default_engine", engine)
+            .toString().toRequestBody(json)
+        return exec(Request.Builder().url("$base/profiles").post(body).build()) {
+            parseProfile(JSONObject(it.body!!.string()))
+        }
+    }
+
     // POST /profiles/{id}/samples multipart: file (wav), reference_text
     suspend fun addSample(profileId: String, wav: File, referenceText: String) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("file", wav.name, wav.asRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("file", wav.name, wav.asRequestBody(mediaTypeFor(wav)))
             .addFormDataPart("reference_text", referenceText)
             .build()
         exec(Request.Builder().url("$base/profiles/$profileId/samples").post(body).build()) { }
@@ -313,7 +446,7 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
     // POST /transcribe multipart: file -> {text, duration}
     suspend fun transcribe(wav: File): String {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("file", wav.name, wav.asRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("file", wav.name, wav.asRequestBody(mediaTypeFor(wav)))
             .build()
         return exec(Request.Builder().url("$base/transcribe").post(body).build()) {
             JSONObject(it.body!!.string()).getString("text")
@@ -321,8 +454,9 @@ class VoiceboxApi(baseUrl: String, apiKey: String) {
     }
 
     // POST /generate -> {id,status:"generating"}; poll GET /history/{id}; then GET /audio/{id}
-    suspend fun generate(profileId: String, text: String, language: String, onStatus: (String) -> Unit = {}): ByteArray {
+    suspend fun generate(profileId: String, text: String, language: String, engine: String? = null, onStatus: (String) -> Unit = {}): ByteArray {
         val body = JSONObject().put("profile_id", profileId).put("text", text).put("language", language)
+            .apply { if (engine != null) put("engine", engine) }
             .toString().toRequestBody(json)
         val id = exec(Request.Builder().url("$base/generate").post(body).build()) {
             JSONObject(it.body!!.string()).getString("id")
